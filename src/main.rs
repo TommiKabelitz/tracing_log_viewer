@@ -8,11 +8,17 @@
 //! comes in fully, before reusing the indices for the TIMESTAMP, LOG_LEVEL and start
 //! of SOURCE and simply parsing the rest of the string from there.
 //!
+use std::ffi::c_int;
 use std::fs::{self, File};
 use std::io::{self, BufRead, Write};
 use std::process::{Child, Command, Stdio, exit};
 
 use clap::{Parser, command};
+
+unsafe extern "C" {
+    fn isatty(fd: c_int) -> c_int;
+}
+const STDIN_FILENO: c_int = 0;
 
 /// Recolour tracing logs and view them in less. Supports piping of input and output
 #[derive(Parser, Debug)]
@@ -37,7 +43,7 @@ fn main() -> io::Result<()> {
         let file = File::open(&file)?;
         InputSource::File(io::BufReader::new(file))
     } else {
-        let is_a_tty = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
+        let is_a_tty = unsafe { isatty(STDIN_FILENO) == 1 };
         if is_a_tty {
             eprintln!("Missing filename");
             exit(1)
