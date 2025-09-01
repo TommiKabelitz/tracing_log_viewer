@@ -1,15 +1,25 @@
-use std::fs::File;
+//! Colourises tracing logs of form `TIMESTAMP LOG_LEVEL SOURCE: LOG_MESSAGE` eg.
+//!
+//! 2025-08-28T04:57:18.797136Z INFO  crate::path::file: I am the log message
+//!
+//! We assume that the TIMESTAMP will be of constant length within a set of logs,
+//! that the LOG_LEVEL will of length 5, padded with spaces at the end and that the
+//! SOURCE and LOG_MESSAGE will vary in length. As such, we parse the first log that
+//! comes in fully, before reusing the indices for the TIMESTAMP, LOG_LEVEL and start
+//! of SOURCE and simply parsing the rest of the string from there.
+//!
+use std::fs::{self, File};
 use std::io::{self, BufRead, Write};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Stdio, exit};
 
 use clap::{Parser, command};
 
-/// Recolor tracing logs and view them in less
+/// Recolour tracing logs and view them in less. Supports piping of input and output
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Args {
     /// The log file to parse
-    file: String,
+    file: Option<String>,
 
     /// Output directly to stdout for piping rather than opening less
     #[arg(short = 'P', long = "pipe")]
@@ -23,8 +33,17 @@ struct Args {
 fn main() -> io::Result<()> {
     let args = Args::parse();
 
-    let file = File::open(&args.file)?;
-    let reader = io::BufReader::new(file);
+    let reader = if let Some(file) = args.file {
+        let file = File::open(&file)?;
+        InputSource::File(io::BufReader::new(file))
+    } else {
+        let is_a_tty = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
+        if is_a_tty {
+            eprintln!("Missing filename");
+            exit(1)
+        }
+        InputSource::Pipe(io::stdin().lock())
+    };
 
     let mut child: Option<Child> = None;
     let mut write_destination = if args.pipe {
@@ -50,20 +69,20 @@ fn main() -> io::Result<()> {
     for line in reader.lines() {
         let l = line?;
         let new_line = if let Some(format) = general_format {
-            if let Some(format) = parse_line_path(&l, format) {
-                colorize_line(&l, format)
+            if let Some(full_format) = parse_line_path_from_general_format(&l, format) {
+                colorize_line(&l, full_format)
             } else {
                 format!("FAILED TO PARSE LINE: {}", l)
             }
-        } else if let Some(format) = parse_line(&l) {
+        } else if let Some(full_format) = parse_line_from_scratch(&l) {
             general_format = Some(GeneralLineFormat {
-                tz_start: format.tz_start,
-                tz_end: format.tz_end,
-                level_start: format.level_start,
-                level_end: format.level_end,
-                path_start: format.path_start,
+                tz_start: full_format.tz_start,
+                tz_end: full_format.tz_end,
+                level_start: full_format.level_start,
+                level_end: full_format.level_end,
+                path_start: full_format.path_start,
             });
-            colorize_line(&l, format)
+            colorize_line(&l, full_format)
         } else {
             format!("FAILED TO PARSE LINE: {}", l)
         };
@@ -76,6 +95,35 @@ fn main() -> io::Result<()> {
     }
 
     Ok(())
+}
+
+enum InputSource {
+    File(io::BufReader<fs::File>),
+    Pipe(io::StdinLock<'static>),
+}
+
+impl std::io::Read for InputSource {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::File(f) => f.read(buf),
+            Self::Pipe(p) => p.read(buf),
+        }
+    }
+}
+
+impl std::io::BufRead for InputSource {
+    fn consume(&mut self, amount: usize) {
+        match self {
+            Self::File(f) => f.consume(amount),
+            Self::Pipe(p) => p.consume(amount),
+        }
+    }
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        match self {
+            Self::File(f) => f.fill_buf(),
+            Self::Pipe(p) => p.fill_buf(),
+        }
+    }
 }
 
 enum WriteDestination {
@@ -110,11 +158,11 @@ enum LogType {
 impl LogType {
     pub fn as_colour_str(&self) -> &'static str {
         match self {
-            Self::Error => "\x1b[91m",
-            Self::Warn => "\x1b[93m",
-            Self::Info => "\x1b[92m",
-            Self::Debug => "\x1b[94m",
-            Self::Trace => "\x1b[95m",
+            Self::Error => "\x1b[91m", // Red
+            Self::Warn => "\x1b[93m",  // Yellow
+            Self::Info => "\x1b[92m",  // Green
+            Self::Debug => "\x1b[94m", // Blue
+            Self::Trace => "\x1b[95m", // Purple
         }
     }
 }
@@ -142,8 +190,8 @@ struct LineFormat {
 /// Parse the line to obtain the full format.
 ///
 /// Returns None if it fails to parse. Returning
-/// Some does not guarantee a correct parse
-fn parse_line(line: &str) -> Option<LineFormat> {
+/// Some does not guarantee a correct parse.
+fn parse_line_from_scratch(line: &str) -> Option<LineFormat> {
     if line.len() < 4 {
         return None;
     }
@@ -192,7 +240,10 @@ fn parse_line(line: &str) -> Option<LineFormat> {
 }
 
 /// Given a general format, parse the log type and path end location to create a full LineFormat
-fn parse_line_path(line: &str, general_format: GeneralLineFormat) -> Option<LineFormat> {
+fn parse_line_path_from_general_format(
+    line: &str,
+    general_format: GeneralLineFormat,
+) -> Option<LineFormat> {
     let log_type = match line[general_format.level_start..general_format.level_end]
         .trim()
         .to_ascii_lowercase()
